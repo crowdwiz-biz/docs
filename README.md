@@ -500,3 +500,690 @@ def handle_deposits(bot):
 					print("Account not linked")
 ```
 *Полный исходный код примера размещён на [github](https://github.com/crowdwiz-biz/cwd-auth-gateway)*
+
+<!-- ### Пример №2: Автоматическая реферальная система на базе платформы CrowdWiz
+*Полный исходный код примера размещён на [github](https://github.com/crowdwiz-biz/cwd-merchant-referral)* -->
+
+## Разработка нового функционала ядра блокчейна CrowdWiz
+Как уже писали ранее, разработка функционала ядра сводится к тому, что нужно добавить новые объекты и операции. Рассмотрим добавление нового функционала на примере игры орёл и решка (flipcoin) которая уже реализована на нашей платформе.
+
+При добавлении новых функций нам необходимо придерживаться той структуры которая была разработана в оригинальном Graphene/Bitshares, поэтому необходимо соблюдать определённое расположение файлов и дополнять объекты необходимыми для работы свойствами.
+
+### Логика работы игры Орёл или Решка
+Игра должна быть децентрализованная, люди должны играть между собой.
+* Один игрок делает ставку (это первая новая операция)
+* Второй игрок отвечает на эту ставку (это вторая новая операция)
+* Если на ставку нет ответа более 60 минут с момента совершения ставки, она отменяется (за это отвечает специальная функция которая выполняется при сборке блока)
+* После того как на ставку ответили, происходит определение победителя. Для того чтобы на всех узлах победитель определялся одинаково, в качестве генератора случайных чисел должен использоваться какой-то объект блокчейна. Мы будем использовать так называемую технологию блока из будущего. Суть её заключается в том, что после того как на ставку ответили, ставка помечается как ожидающая розыгрыша. И победитель опледеляется при генерации следующего блока на основе хеша этого блока. То есть на момент ответа на ставку этого блока ещё не существует.
+
+> Операции выигрыша, проигрыша и отмены ставки - виртуальные. То есть их инициирует не пользователь, а сам блокчейн при сборке блока. Они не выполняют никаких функций, и нужны в общем для того, чтобы действие отображалось в истории операций пользователя. Как мы увидим дальше у этих операций нет эвалюатора.
+
+### Создание объектов
+Для реализации нашей игры нам понадобится новый тип объекта в блокчейне, назовём его flipcoin. 
+
+Сначала создадим файл в котором опишем этот объект:
+```
+libraries/chain/include/graphene/chain/gamezone_object.hpp
+```
+Теперь опишем в нём наш объект flipcoin.
+Помимо идентификаторов типа объекта в нём будут следующие свойства:
+* bettor - игрок который делает ставку (создаёт объект) типа account
+* caller - игрок который отвечает на ставку типа optional account, поскольку этот второй игрок появляется не сразу
+* winner - победитель типа optional account
+* bet - это сумма ставки, типа asset
+* nonce - дополнительная случайная переменная
+* expiration - дата истечения ставки
+* status - статус ставки (активная, отвеченая, победитель определён)
+
+Также нам понадобятся индексы чтобы мы могли выбирать эти объекты по Id, по статусу и по времени истечения.
+
+```cpp
+#pragma once
+#include <graphene/chain/protocol/asset.hpp>
+#include <graphene/chain/protocol/types.hpp>
+#include <graphene/chain/protocol/operations.hpp>
+
+#include <graphene/db/object.hpp>
+#include <graphene/db/generic_index.hpp>
+#include <boost/multi_index/composite_key.hpp>
+
+namespace graphene { namespace chain {
+   using namespace graphene::db;
+
+   class flipcoin_object : public abstract_object<flipcoin_object>
+   {
+      public:
+        static const uint8_t space_id = protocol_ids;
+        static const uint8_t type_id = flipcoin_object_type;
+		account_id_type bettor;
+		optional <account_id_type> caller;
+		optional <account_id_type> winner;
+        asset bet;
+        uint8_t nonce = 1;
+        time_point_sec expiration;
+        uint8_t status = 0; //0 = active, 1 = filled, 2 = flipped
+   };
+
+    struct by_id;
+    struct by_status;
+    struct by_expiration;
+
+    using flipcoin_multi_index_type = multi_index_container<
+      flipcoin_object,
+      indexed_by<
+         ordered_unique< tag<by_id>,
+            member<object, object_id_type, &object::id>
+         >,
+         ordered_non_unique< tag<by_status>,
+            composite_key<
+               flipcoin_object,
+               member<flipcoin_object, uint8_t, &flipcoin_object::status>,
+               member< object, object_id_type, &object::id>
+            >
+         >,
+         ordered_unique< tag<by_expiration>,
+            composite_key< flipcoin_object,
+               member< flipcoin_object, time_point_sec, &flipcoin_object::expiration>,
+               member< object, object_id_type, &object::id>
+            >
+         >
+      >
+   >;
+   using flipcoin_index = generic_index<flipcoin_object, flipcoin_multi_index_type>;
+} } // graphene::chain
+
+FC_REFLECT_DERIVED( graphene::chain::flipcoin_object, (graphene::db::object),
+	(bettor)
+	(caller)
+	(winner)
+	(bet)
+	(nonce)
+	(expiration)
+	(status)
+) 
+```
+После этого необходимо прописать новый объект в ядре блокчейна, это делается в нескольких файлах (покажем только вносимые изменения, детально можно посмотеть в указанных файлах)
+
+```
+libraries/chain/include/graphene/chain/protocol/types.hpp //определяет типы
+```
+```cpp
+namespace graphene { namespace chain {
+...
+   enum object_type
+   {
+...
+      flipcoin_object_type, 
+...
+   };
+...
+   class flipcoin_object;
+...
+   typedef object_id< protocol_ids, flipcoin_object_type,flipcoin_object> flipcoin_id_type;
+...
+} }  
+
+FC_REFLECT_ENUM( graphene::chain::object_type,
+...
+                 (flipcoin_object_type)
+...
+               )
+...
+FC_REFLECT_TYPENAME( graphene::chain::flipcoin_id_type )
+...
+```
+
+```
+libraries/chain/db_init.cpp //файл инициализации базы данных
+```
+```cpp
+#include <graphene/chain/gamezone_object.hpp> 
+...
+const uint8_t flipcoin_object::space_id; //Идентификаторы типа объекта
+const uint8_t flipcoin_object::type_id; //Идентификаторы типа объекта
+...
+add_index< primary_index<flipcoin_index> >(); //Поисковой индекс нового объекта
+...
+```
+```
+libraries/chain/db_notify.cpp //устанавливает взаимосвязь между объектами
+```
+```cpp
+#include <graphene/chain/gamezone_object.hpp>
+...
+void get_relevant_accounts( const object* obj, flat_set<account_id_type>& accounts )
+{
+...
+        case flipcoin_object_type:{
+           const auto& aobj = dynamic_cast<const flipcoin_object*>(obj);
+           FC_ASSERT( aobj != nullptr );
+           accounts.insert( aobj->bettor ); //Обект связан с аккаунтом который его создал
+           break;
+        }
+...
+} 
+```
+### Создание операций
+Теперь нам нужно создать операции связанные с нашим новым функционалом. Для этого нам нужно сначала описать операции, а после этого для каждой операции нужно создать эвалюатор - в нём будут происходить все связанные с операцией действия.
+
+Для того чтобы описать операции нужно создать файлы которые содержат в себе структуру операций и базовые проверки
+> В каждой операции есть `struct fee_parameters_type { uint64_t fee = XXXX; };` это комиссия за операцию по умолчанию. Также в каждой операции есть `fee_payer()` это тот аккаунт который оплачивает комиссию за операцию, а значит является её инициатором.
+
+```
+libraries/chain/include/graphene/chain/protocol/gamezone.hpp //содержит в себе описание структуры операции
+```
+
+```cpp
+#pragma once
+#include <graphene/chain/protocol/base.hpp>
+
+namespace graphene { namespace chain { 
+
+   struct flipcoin_bet_operation : public base_operation //сделать ставку
+   {
+      struct fee_parameters_type { uint64_t fee = 0; };
+
+      asset             fee;
+      account_id_type   bettor;
+      asset             bet;
+      uint8_t           nonce;
+
+      account_id_type 	fee_payer()const { return bettor; }
+      void            	validate()const;
+   };
+
+   struct flipcoin_call_operation : public base_operation //ответить на ставку
+   {
+      struct fee_parameters_type { share_type fee = 0; };
+
+      asset             fee;
+      flipcoin_id_type   flipcoin;
+      account_id_type   caller;
+      asset             bet;
+
+      account_id_type 	fee_payer()const { return caller; }
+      void            	validate()const;
+   };
+
+   struct flipcoin_win_operation : public base_operation //виртуальная операция выигрыша
+   {
+      struct fee_parameters_type { share_type fee = 0; };
+
+      asset             fee;
+      flipcoin_id_type   flipcoin;
+      account_id_type   winner;
+      asset             payout;
+      asset             referral_payout;
+
+      account_id_type 	fee_payer()const { return winner; }
+      void            	validate()const;
+   };
+
+   struct flipcoin_loose_operation : public base_operation //виртуальная операция проигрыша
+   {
+      struct fee_parameters_type { share_type fee = 0; };
+
+      asset             fee;
+      flipcoin_id_type   flipcoin;
+      account_id_type   looser;
+      asset             bet;
+
+      account_id_type 	fee_payer()const { return looser; }
+      void            	validate()const;
+   };
+
+   struct flipcoin_cancel_operation : public base_operation//виртуальная операция отмены ставки
+   {
+      struct fee_parameters_type { share_type fee = 0; };
+
+      asset             fee;
+      flipcoin_id_type   flipcoin;
+      account_id_type   bettor;
+      asset             bet;
+
+      account_id_type 	fee_payer()const { return bettor; }
+      void            	validate()const;
+   };
+} } // graphene::chain
+FC_REFLECT( graphene::chain::flipcoin_bet_operation::fee_parameters_type, (fee) )
+FC_REFLECT( graphene::chain::flipcoin_bet_operation, (fee)(bettor)(bet)(nonce))
+
+FC_REFLECT( graphene::chain::flipcoin_call_operation::fee_parameters_type, (fee) )
+FC_REFLECT( graphene::chain::flipcoin_call_operation, (fee)(flipcoin)(caller)(bet))
+
+FC_REFLECT( graphene::chain::flipcoin_win_operation::fee_parameters_type, (fee) )
+FC_REFLECT( graphene::chain::flipcoin_win_operation, (fee)(flipcoin)(winner)(payout)(referral_payout))
+
+FC_REFLECT( graphene::chain::flipcoin_loose_operation::fee_parameters_type, (fee) )
+FC_REFLECT( graphene::chain::flipcoin_loose_operation, (fee)(flipcoin)(looser)(bet))
+
+FC_REFLECT( graphene::chain::flipcoin_cancel_operation::fee_parameters_type, (fee) )
+FC_REFLECT( graphene::chain::flipcoin_cancel_operation, (fee)(flipcoin)(bettor)(bet) )
+```
+
+```
+libraries/chain/protocol/gamezone.cpp //содержит базовые проверки
+```
+```cpp
+#include <graphene/chain/protocol/gamezone.hpp>
+
+namespace graphene { namespace chain {
+
+    share_type cut_fee_gamezone(share_type a, uint16_t p)
+    {
+    if( a == 0 || p == 0 )
+        return 0;
+    if( p == GRAPHENE_100_PERCENT )
+        return a;
+
+    fc::uint128 r(a.value);
+    r *= p;
+    r /= GRAPHENE_100_PERCENT;
+    return r.to_uint64();
+    }
+
+    void flipcoin_bet_operation::validate()const
+    {
+    FC_ASSERT( fee.amount >= 0 );
+    FC_ASSERT( bet.amount > 0 );
+    }
+
+    void flipcoin_call_operation::validate()const
+    {
+    FC_ASSERT( fee.amount >= 0 );
+    FC_ASSERT( bet.amount >= 0 );
+    }
+    void flipcoin_win_operation::validate()const
+    {
+    FC_ASSERT( fee.amount >= 0 );
+    FC_ASSERT( payout.amount >= 0 );
+    FC_ASSERT( referral_payout.amount >= 0 );
+    }
+    void flipcoin_loose_operation::validate()const
+    {
+    FC_ASSERT( fee.amount >= 0 );
+    FC_ASSERT( bet.amount >= 0 );
+    }
+    void flipcoin_cancel_operation::validate()const
+    {
+    FC_ASSERT( fee.amount >= 0 );
+    FC_ASSERT( bet.amount >= 0 );
+    }
+} } 
+```
+
+Теперь нужно добавить наши операции в список операций блокчейна:
+```
+libraries/chain/include/graphene/chain/protocol/operations.hpp
+```
+```cpp
+#pragma once
+...
+#include <graphene/chain/protocol/gamezone.hpp>
+...
+namespace graphene { namespace chain {
+   typedef fc::static_variant<
+...
+            flipcoin_bet_operation,  //GAMEZONE
+            flipcoin_call_operation,  //GAMEZONE
+            flipcoin_win_operation,  //VOP
+            flipcoin_cancel_operation,  //VOP
+            flipcoin_loose_operation,  //VOP
+...
+         > operation;
+...
+} } // graphene::chain
+...
+```
+Также нужно указать в истории операций какого аккаунта будет отображаться та или иная операция, это необходимо прописать в файле
+```
+libraries/chain/db_notify.cpp
+```
+```cpp
+#include <graphene/chain/gamezone_object.hpp>
+...
+using namespace fc;
+using namespace graphene::chain;
+struct get_impacted_account_visitor
+{
+...
+   void operator()( const flipcoin_bet_operation& op )
+   {
+      _impacted.insert( op.fee_payer() ); 
+   }
+   void operator()( const flipcoin_call_operation& op )
+   {
+      _impacted.insert( op.fee_payer() ); 
+   }
+   void operator()( const flipcoin_win_operation& op )
+   {
+      _impacted.insert( op.winner); 
+   }
+   void operator()( const flipcoin_loose_operation& op )
+   {
+      _impacted.insert( op.looser); 
+   }
+   void operator()( const flipcoin_cancel_operation& op )
+   {
+      _impacted.insert( op.bettor); 
+   }
+...
+};
+
+```
+
+Теперь можно переходить к написанию логики работы каждой конкретной операции, нужно написать так называемые эвалюаторы.
+
+```
+libraries/chain/include/graphene/chain/gamezone_evaluator.hpp
+```
+> do_evaluate функция которая проверяет, что операция может быть выполнена конкретным аккаунтом
+
+>do_apply вносит изменения в объекты блокчейна
+```cpp
+#pragma once
+#include <graphene/chain/evaluator.hpp>
+#include <graphene/chain/gamezone_object.hpp>
+
+namespace graphene { namespace chain {
+
+   class flipcoin_bet_evaluator : public evaluator<flipcoin_bet_evaluator>
+   {
+      public:
+         typedef flipcoin_bet_operation operation_type;
+
+         void_result do_evaluate( const flipcoin_bet_operation& o );
+         object_id_type do_apply( const flipcoin_bet_operation& o );
+   };
+
+   class flipcoin_call_evaluator : public evaluator<flipcoin_call_evaluator>
+   {
+      public:
+         typedef flipcoin_call_operation operation_type;
+
+         void_result do_evaluate( const flipcoin_call_operation& o );
+         void_result do_apply( const flipcoin_call_operation& o );
+        const flipcoin_object* flipcoin;
+   };
+
+} } // graphene::chain 
+```
+
+```
+libraries/chain/gamezone_evaluator.cpp
+```
+```cpp
+#include <graphene/chain/gamezone_evaluator.hpp>
+#include <graphene/chain/gamezone_object.hpp>
+#include <graphene/chain/account_object.hpp>
+#include <graphene/chain/database.hpp>
+#include <graphene/chain/hardfork.hpp>
+
+namespace graphene
+{
+namespace chain
+{
+
+share_type cut_fee_game(share_type a, uint16_t p)
+{
+   if (a == 0 || p == 0)
+      return 0;
+   if (p == GRAPHENE_100_PERCENT)
+      return a;
+
+   fc::uint128 r(a.value);
+   r *= p;
+   r /= GRAPHENE_100_PERCENT;
+   return r.to_uint64();
+}
+
+void_result flipcoin_bet_evaluator::do_evaluate(const flipcoin_bet_operation &op)
+{
+    try
+    {
+      database& d = db();
+		const account_object& bettor    	= op.bettor(d);
+		const asset_object&   asset_type    = op.bet.asset_id(d);
+
+      FC_ASSERT( op.bet.asset_id == asset_id_type(), "Price must be in core asset");
+      FC_ASSERT( op.bet.amount >= 1000,  "Bet amount must be more or equal than 0.01 CWD");
+
+     	bool insufficient_balance = d.get_balance( bettor, asset_type ).amount >= op.bet.amount;
+     	FC_ASSERT( insufficient_balance,
+                 "Insufficient Balance: ${balance}, unable to bet '${total_bet}' from account '${a}'", 
+                 ("a",bettor.name)("total_bet",d.to_pretty_string(op.bet))("balance",d.to_pretty_string(d.get_balance(bettor, asset_type))) );
+        return void_result();
+    }
+    FC_CAPTURE_AND_RETHROW((op))
+}
+
+object_id_type flipcoin_bet_evaluator::do_apply(const flipcoin_bet_operation &op)
+{
+    try
+    {
+        database& d = db();
+		db().adjust_balance( op.bettor, -op.bet );
+
+        const auto& new_flipcoin_object = db().create<flipcoin_object>([&](flipcoin_object &obj) {
+            obj.bettor = op.bettor;
+            obj.bet = op.bet;
+            obj.status = 0;
+			obj.nonce = op.nonce;
+            obj.expiration = d.head_block_time() + fc::hours(1);
+        });
+        return new_flipcoin_object.id;
+    }
+    FC_CAPTURE_AND_RETHROW((op))
+}
+
+void_result flipcoin_call_evaluator::do_evaluate(const flipcoin_call_operation &op)
+{
+    try
+    {
+      database& d = db();
+		flipcoin = &op.flipcoin(d);
+
+		const account_object& caller    	= op.caller(d);
+		const asset_object&   asset_type    = op.bet.asset_id(d);
+
+     	bool insufficient_balance = d.get_balance( caller, asset_type ).amount >= op.bet.amount;
+     	FC_ASSERT( insufficient_balance,
+                 "Insufficient Balance: ${balance}, unable to bet '${total_bet}' from account '${a}'", 
+                 ("a",caller.name)("total_bet",d.to_pretty_string(op.bet))("balance",d.to_pretty_string(d.get_balance(caller, asset_type))) );
+		FC_ASSERT(flipcoin->status == 0, "flipcoin already called");
+		FC_ASSERT(flipcoin->expiration >= d.head_block_time(), "flipcoin already called");
+		FC_ASSERT(flipcoin->bet.amount == op.bet.amount, "flipcoin bet amount must match");
+
+        return void_result();
+    }
+    FC_CAPTURE_AND_RETHROW((op))
+}
+
+void_result flipcoin_call_evaluator::do_apply(const flipcoin_call_operation &op)
+{
+    try
+    {
+        database& d = db();
+		db().adjust_balance( op.caller, -op.bet );
+		d.modify(
+			d.get(op.flipcoin),
+			[&]( flipcoin_object& f )
+			{
+				f.status = 1;
+				f.caller = op.caller;
+                f.expiration = d.head_block_time() + fc::seconds(10);
+			}
+		);
+        return void_result();
+    }
+    FC_CAPTURE_AND_RETHROW((op))
+}
+
+}} // namespace chain
+```
+
+Теперь нужно зарегистрировать наши новые эвалюаторы
+```
+libraries/chain/db_init.cpp
+```
+```cpp
+void database::initialize_evaluators()
+{
+...
+   register_evaluator<flipcoin_bet_evaluator>(); 
+   register_evaluator<flipcoin_call_evaluator>(); 
+...
+} 
+```
+### Создание функций вызывающихся при сборке блоков
+В файлах базы данных блокчейна нужно определить новую функцию которая будет проверять статус активных ставок, и в зависимости от того сыграла ставка или истекла будет определять победителя и проигравшего, или отменять ставку. А затем нам нужно будет вызывать эту функцию при сборке блока.
+```
+libraries/chain/include/graphene/chain/database.hpp
+```
+Опишем нашу новую функцию
+```cpp
+...
+//////////////////// db_update.cpp ////////////////////
+...
+void proceed_bets();
+...
+```
+Теперь пропишем её функционал в файле
+```
+libraries/chain/db_update.cpp
+```
+```cpp
+void database::proceed_bets()
+{ try {
+   auto head_time = head_block_time();
+
+   auto& flipcoin_idx = get_index_type<flipcoin_index>().indices().get<by_expiration>();
+   while( !flipcoin_idx.empty() && flipcoin_idx.begin()->expiration <= head_time && flipcoin_idx.begin()->status < 2 )
+   {
+      auto block_id = head_block_id();
+      const flipcoin_object& flipcoin = *flipcoin_idx.begin();
+      uint8_t check_nonce = 8+flipcoin.nonce;
+      if (check_nonce>39) {
+         check_nonce = 39;
+      }
+      std::string id_substr = std::string(block_id).substr(check_nonce,1);
+      if(flipcoin.status == 0) {
+         flipcoin_log( "proceed_bets: CANCEL FLIPCOIN: ${b}", ("b", flipcoin.id) );
+         adjust_balance( flipcoin.bettor, flipcoin.bet );
+         flipcoin_cancel_operation vop_cancel;
+         vop_cancel.flipcoin = flipcoin.id;
+         vop_cancel.bettor = flipcoin.bettor;
+         vop_cancel.bet = flipcoin.bet;
+         push_applied_operation( vop_cancel );
+
+         remove(flipcoin);
+      }
+      if (flipcoin.status == 1) {
+         flipcoin_log( "proceed_bets: FLIP FLIPCOIN: ${b}", ("b", flipcoin.id) );
+         flipcoin_log( "proceed_bets: block ID: ${b}", ("b", block_id) );
+         flipcoin_log( "proceed_bets: block NUM: ${b}", ("b", head_block_num()) );
+         flipcoin_log( "proceed_bets: block TIME: ${b}", ("b", head_time) );
+         flipcoin_log( "proceed_bets: ID SUBSTRING: ${b}", ("b", id_substr) );
+         bool heads;
+         switch(id_substr[0])
+               {
+                     case '0': heads = true; break;
+                     case '1': heads = false; break;
+                     case '2': heads = true; break;
+                     case '3': heads = false; break;
+                     case '4': heads = true; break;
+                     case '5': heads = false; break;
+                     case '6': heads = true; break;
+                     case '7': heads = false; break;
+                     case '8': heads = true; break;
+                     case '9': heads = false; break;
+                     case 'a': heads = true; break;
+                     case 'b': heads = false; break;
+                     case 'c': heads = true; break;
+                     case 'd': heads = false; break;
+                     case 'e': heads = true; break;
+                     case 'f': heads = false; break;
+               }
+         flipcoin_log( "proceed_bets: HEADS: ${b}", ("b", heads) );
+         flipcoin_log( "proceed_bets: flipcoin: ${b}", ("b", flipcoin ) );
+         asset prize;
+         prize.asset_id = flipcoin.bet.asset_id;
+         prize.amount = count_prize(flipcoin.bet.amount);
+         asset referral_prize;
+         referral_prize.asset_id = flipcoin.bet.asset_id;
+         referral_prize.amount = count_referral_prize(flipcoin.bet.amount);
+
+         flipcoin_win_operation vop_win;
+         flipcoin_loose_operation vop_loose;
+
+         vop_win.flipcoin = flipcoin.id;
+         vop_win.payout = prize;
+         vop_win.referral_payout = referral_prize;
+
+         vop_loose.flipcoin = flipcoin.id;
+         vop_loose.bet = flipcoin.bet;
+         
+         const account_object& caller = get(*flipcoin.caller);
+
+         if(heads == true) {
+            flipcoin_log( "proceed_bets: Winner: ${b}", ("b", flipcoin.bettor ) );
+            vop_win.winner = flipcoin.bettor;     
+            vop_loose.looser =  caller.id;
+            adjust_balance( flipcoin.bettor, prize );
+         }
+         else {
+            flipcoin_log( "proceed_bets: Winner: ${b}", ("b", flipcoin.caller ) );
+            vop_win.winner = caller.id;
+            vop_loose.looser = flipcoin.bettor;
+            adjust_balance( caller.id, prize );
+         }
+         push_applied_operation( vop_win );
+         push_applied_operation( vop_loose );
+
+         const account_object& winner_account = get(vop_win.winner);
+         const account_object& looser_account = get(vop_loose.looser);
+
+         winner_account.statistics(*this).update_nv(referral_prize.amount, uint8_t(1) , uint8_t(0) , winner_account, *this);
+         const account_statistics_object& customer_statistics = winner_account.statistics(*this);
+
+         if ( head_block_time() >= HARDFORK_CWD2_TIME ) {
+            winner_account.statistics(*this).update_pv(flipcoin.bet.amount, winner_account, *this);
+            looser_account.statistics(*this).update_pv(flipcoin.bet.amount, looser_account, *this);
+         }
+         else {
+            winner_account.statistics(*this).update_pv(referral_prize.amount, winner_account, *this);
+         }
+
+         modify(customer_statistics, [&](account_statistics_object& s)
+         {
+            s.pay_fee( referral_prize.amount, false );
+         });
+         //--------
+         // if (head_time < HARDFORK_CWD6_TIME) {
+            modify(winner_account, [&](account_object& a) {
+               a.statistics(*this).process_fees(a, *this);
+            });
+         // }
+         // -----------------------
+
+         remove(flipcoin);
+      }
+   }
+} FC_CAPTURE_AND_RETHROW() }
+```
+И будем вызывать её каждый блок:
+```
+libraries/chain/db_block.cpp
+```
+```cpp
+void database::_apply_block( const signed_block& next_block )
+{ try {
+   uint32_t next_block_num = next_block.block_num();
+   uint32_t skip = get_node_properties().skip_flags;
+   _applied_ops.clear();
+...
+   proceed_bets();
+...
+} FC_CAPTURE_AND_RETHROW( (next_block.block_num()) )  }
+
+```
